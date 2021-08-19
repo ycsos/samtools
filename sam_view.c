@@ -45,6 +45,11 @@ DEALINGS IN THE SOFTWARE.  */
 KHASH_SET_INIT_STR(str)
 
 typedef khash_t(str) *strhash_t;
+KHASH_SET_INIT_STR(rg)
+KHASH_SET_INIT_INT(aux_exists)
+
+typedef khash_t(rg) *rghash_t;
+typedef khash_t(aux_exists) *auxhash_t;
 
 // This structure contains the settings for a samview run
 typedef struct samview_settings {
@@ -66,6 +71,10 @@ typedef struct samview_settings {
     int multi_region;
     char* tag;
     hts_filter_t *filter;
+    int remove_flag;
+    int add_flag;
+    auxhash_t remove_tag;
+    auxhash_t keep_tag;
 } samview_settings_t;
 
 
@@ -73,9 +82,60 @@ typedef struct samview_settings {
 extern const char *bam_get_library(sam_hdr_t *header, const bam1_t *b);
 extern int bam_remove_B(bam1_t *b);
 
+// Copied from htslib/sam.c.
+// TODO: we need a proper interface to find the length of an aux tag,
+// or at the very make exportable versions of these in htslib.
+static inline int aux_type2size(uint8_t type)
+{
+    switch (type) {
+    case 'A': case 'c': case 'C':
+        return 1;
+    case 's': case 'S':
+        return 2;
+    case 'i': case 'I': case 'f':
+        return 4;
+    case 'd':
+        return 8;
+    case 'Z': case 'H': case 'B':
+        return type;
+    default:
+        return 0;
+    }
+}
+
+// Copied from htslib/sam.c.
+static inline uint8_t *skip_aux(uint8_t *s, uint8_t *end)
+{
+    int size;
+    uint32_t n;
+    if (s >= end) return end;
+    size = aux_type2size(*s); ++s; // skip type
+    switch (size) {
+    case 'Z':
+    case 'H':
+        while (s < end && *s) ++s;
+        return s < end ? s + 1 : end;
+    case 'B':
+        if (end - s < 5) return NULL;
+        size = aux_type2size(*s); ++s;
+        n = le_to_u32(s);
+        s += 4;
+        if (size == 0 || end - s < size * n) return NULL;
+        return s + size * n;
+    case 0:
+        return NULL;
+    default:
+        if (end - s < size) return NULL;
+        return s + size;
+    }
+}
+
 // Returns 0 to indicate read should be output 1 otherwise
 static int process_aln(const sam_hdr_t *h, bam1_t *b, samview_settings_t* settings)
 {
+    if (settings->filter && sam_passes_filter(h, b, settings->filter) < 1)
+        return 1;
+
     if (settings->remove_B) bam_remove_B(b);
     if (settings->min_qlen > 0) {
         int k, qlen = 0;
@@ -135,18 +195,50 @@ static int process_aln(const sam_hdr_t *h, bam1_t *b, samview_settings_t* settin
         const char *p = bam_get_library((sam_hdr_t*)h, b);
         if (!p || strcmp(p, settings->library) != 0) return 1;
     }
-    if (settings->remove_aux_len) {
-        size_t i;
-        for (i = 0; i < settings->remove_aux_len; ++i) {
-            uint8_t *s = bam_aux_get(b, settings->remove_aux[i]);
-            if (s) {
-                bam_aux_del(b, s);
-            }
-        }
-    }
+    if (settings->keep_tag) {
+        uint8_t *s_from, *s_to, *end = b->data + b->l_data;
+        auxhash_t h = settings->keep_tag;
 
-    if (settings->filter && sam_passes_filter(h, b, settings->filter) < 1)
-        return 1;
+        s_from = s_to = bam_get_aux(b);
+        while (s_from < end) {
+            int x = (int)s_from[0]<<8 | s_from[1];
+            uint8_t *s = skip_aux(s_from+2, end);
+            if (s == NULL) {
+                print_error("view", "malformed aux data for record \"%s\"",
+                            bam_get_qname(b));
+                break;
+            }
+
+            if (kh_get(aux_exists, h, x) != kh_end(h) ) {
+                if (s_to != s_from) memmove(s_to, s_from, s - s_from);
+                s_to += s - s_from;
+            }
+            s_from = s;
+        }
+        b->l_data = s_to - b->data;
+
+    } else if (settings->remove_tag) {
+        uint8_t *s_from, *s_to, *end = b->data + b->l_data;
+        auxhash_t h = settings->remove_tag;
+
+        s_from = s_to = bam_get_aux(b);
+        while (s_from < end) {
+            int x = (int)s_from[0]<<8 | s_from[1];
+            uint8_t *s = skip_aux(s_from+2, end);
+            if (s == NULL) {
+                print_error("view", "malformed aux data for record \"%s\"",
+                            bam_get_qname(b));
+                break;
+            }
+
+            if (kh_get(aux_exists, h, x) == kh_end(h) ) {
+                if (s_to != s_from) memmove(s_to, s_from, s - s_from);
+                s_to += s - s_from;
+            }
+            s_from = s;
+        }
+        b->l_data = s_to - b->data;
+    }
 
     return 0;
 }
@@ -275,6 +367,45 @@ static inline int check_sam_write1(samFile *fp, const sam_hdr_t *h, const bam1_t
     return r;
 }
 
+static inline void change_flag(bam1_t *b, samview_settings_t *settings)
+{
+    if (settings->add_flag)
+        b->core.flag |= settings->add_flag;
+
+    if (settings->remove_flag)
+        b->core.flag &= ~settings->remove_flag;
+}
+
+int parse_aux_list(auxhash_t *h, char *optarg) {
+    if (!*h)
+        *h = kh_init(aux_exists);
+
+    while (strlen(optarg) >= 2) {
+        int x = optarg[0]<<8 | optarg[1];
+        int ret = 0;
+        kh_put(aux_exists, *h, x, &ret);
+        if (ret < 0)
+            return -1;
+
+        optarg += 2;
+        if (*optarg == ',') // allow white-space too for easy `cat file`?
+            optarg++;
+        else if (*optarg != 0)
+            break;
+    }
+
+    if (strlen(optarg) != 0) {
+        fprintf(stderr, "main_samview: Error parsing option, "
+                "auxiliary tags should be exactly two characters long.\n");
+        return -1;
+    }
+
+    return 0;
+}
+
+// Make mnemonic distinct values for longoption-only options
+#define LONGOPT(c)  ((c) + 128)
+
 int main_samview(int argc, char *argv[])
 {
     int c, is_header = 0, is_header_only = 0, ret = 0, compress_level = -1, is_count = 0, has_index_file = 0, no_pg = 0;
@@ -282,7 +413,7 @@ int main_samview(int argc, char *argv[])
     samFile *in = 0, *out = 0, *un_out=0;
     FILE *fp_out = NULL;
     sam_hdr_t *header = NULL;
-    char out_mode[5], out_un_mode[5], *out_format = "";
+    char out_mode[6] = {0}, out_un_mode[6] = {0}, *out_format = "";
     char *fn_in = 0, *fn_idx_in = 0, *fn_out = 0, *fn_fai = 0, *q, *fn_un_out = 0;
     char *fn_out_idx = NULL, *fn_un_out_idx = NULL, *arg_list = NULL;
     sam_global_args ga = SAM_GLOBAL_ARGS_INIT;
@@ -305,13 +436,61 @@ int main_samview(int argc, char *argv[])
         .bed = NULL,
         .multi_region = 0,
         .tag = NULL,
-        .filter = NULL
+        .filter = NULL,
+        .remove_flag = 0,
+        .add_flag = 0,
+        .keep_tag = NULL,
+        .remove_tag = NULL,
     };
 
     static const struct option lopts[] = {
         SAM_OPT_GLOBAL_OPTIONS('-', 0, 'O', 0, 'T', '@'),
-        {"no-PG", no_argument, NULL, 1},
-        { NULL, 0, NULL, 0 }
+        {"add-flags", required_argument, NULL, LONGOPT('a')},
+        {"bam", no_argument, NULL, 'b'},
+        {"count", no_argument, NULL, 'c'},
+        {"cram", no_argument, NULL, 'C'},
+        {"customised-index", no_argument, NULL, 'X'},
+        {"customized-index", no_argument, NULL, 'X'},
+        {"excl-flags", required_argument, NULL, 'F'},
+        {"exclude-flags", required_argument, NULL, 'F'},
+        {"expr", required_argument, NULL, 'e'},
+        {"expression", required_argument, NULL, 'e'},
+        {"fai-reference", required_argument, NULL, 't'},
+        {"fast", no_argument, NULL, '1'},
+        {"header-only", no_argument, NULL, 'H'},
+        {"help", no_argument, NULL, LONGOPT('?')},
+        {"keep-tag", required_argument, NULL, LONGOPT('x') },
+        {"library", required_argument, NULL, 'l'},
+        {"min-mapq", required_argument, NULL, 'q'},
+        {"min-MQ", required_argument, NULL, 'q'},
+        {"min-mq", required_argument, NULL, 'q'},
+        {"min-qlen", required_argument, NULL, 'm'},
+        {"no-header", no_argument, NULL, LONGOPT('H')},
+        {"no-PG", no_argument, NULL, LONGOPT('P')},
+        {"output", required_argument, NULL, 'o'},
+        {"output-unselected", required_argument, NULL, 'U'},
+        {"QNAME-file", required_argument, NULL, 'N'},
+        {"qname-file", required_argument, NULL, 'N'},
+        {"read-group", required_argument, NULL, 'r'},
+        {"read-group-file", required_argument, NULL, 'R'},
+        {"readgroup", required_argument, NULL, 'r'},
+        {"readgroup-file", required_argument, NULL, 'R'},
+        {"region-file", required_argument, NULL, LONGOPT('L')},
+        {"regions-file", required_argument, NULL, LONGOPT('L')},
+        {"remove-B", no_argument, NULL, 'B'},
+        {"remove-flags", required_argument, NULL, LONGOPT('r')},
+        {"remove-tag", required_argument, NULL, 'x'},
+        {"require-flags", required_argument, NULL, 'f'},
+        {"subsample", required_argument, NULL, LONGOPT('s')},
+        {"subsample-seed", required_argument, NULL, LONGOPT('S')},
+        {"tag", required_argument, NULL, 'd'},
+        {"tag-file", required_argument, NULL, 'D'},
+        {"target-file", required_argument, NULL, 'L'},
+        {"targets-file", required_argument, NULL, 'L'},
+        {"uncompressed", no_argument, NULL, 'u'},
+        {"unoutput", required_argument, NULL, 'U'},
+        {"use-index", no_argument, NULL, 'M'},
+        {"with-header", no_argument, NULL, 'h'},
     };
 
     /* parse command-line options */
@@ -331,12 +510,7 @@ int main_samview(int argc, char *argv[])
                             lopts, NULL)) >= 0) {
         switch (c) {
         case 's':
-            if ((settings.subsam_seed = strtol(optarg, &q, 10)) != 0) {
-                // Convert likely user input 0,1,2,... to pseudo-random
-                // values with more entropy and more bits set
-                srand(settings.subsam_seed);
-                settings.subsam_seed = rand();
-            }
+            settings.subsam_seed = strtol(optarg, &q, 10);
             if (q && *q == '.') {
                 settings.subsam_frac = strtod(q, &q);
                 if (*q) ret = 1;
@@ -349,6 +523,14 @@ int main_samview(int argc, char *argv[])
                 goto view_end;
             }
             break;
+        case LONGOPT('s'):
+            settings.subsam_frac = strtod(optarg, &q);
+            if (*q || settings.subsam_frac < 0.0 || settings.subsam_frac > 1.0) {
+                print_error("view", "Incorrect sampling argument \"%s\"", optarg);
+                goto view_end;
+            }
+            break;
+        case LONGOPT('S'): settings.subsam_seed = atoi(optarg); break;
         case 'm': settings.min_qlen = atoi(optarg); break;
         case 'c': is_count = 1; break;
         case 'S': break;
@@ -357,16 +539,20 @@ int main_samview(int argc, char *argv[])
         case 't': fn_fai = strdup(optarg); break;
         case 'h': is_header = 1; break;
         case 'H': is_header_only = 1; break;
+        case LONGOPT('H'): is_header = is_header_only = 0; break;
         case 'o': fn_out = strdup(optarg); break;
         case 'U': fn_un_out = strdup(optarg); break;
         case 'X': has_index_file = 1; break;
-        case 'f': settings.flag_on |= strtol(optarg, 0, 0); break;
-        case 'F': settings.flag_off |= strtol(optarg, 0, 0); break;
-        case 'G': settings.flag_alloff |= strtol(optarg, 0, 0); break;
+        case 'f': settings.flag_on |= bam_str2flag(optarg); break;
+        case 'F': settings.flag_off |= bam_str2flag(optarg); break;
+        case 'G': settings.flag_alloff |= bam_str2flag(optarg); break;
         case 'q': settings.min_mapQ = atoi(optarg); break;
         case 'u': compress_level = 0; break;
         case '1': compress_level = 1; break;
         case 'l': settings.library = strdup(optarg); break;
+        case LONGOPT('L'):
+            settings.multi_region = 1;
+            // fall through
         case 'L':
             if ((settings.bed = bed_read(optarg)) == NULL) {
                 print_error_errno("view", "Could not read file \"%s\"", optarg);
@@ -454,6 +640,8 @@ int main_samview(int argc, char *argv[])
         //case 'x': out_format = "x"; break;
         //case 'X': out_format = "X"; break;
                  */
+        case LONGOPT('?'):
+            return usage(stdout, EXIT_SUCCESS, 1);
         case '?':
             if (optopt == '?') {  // '-?' appeared on command line
                 return usage(stdout, EXIT_SUCCESS, 1);
@@ -472,24 +660,33 @@ int main_samview(int argc, char *argv[])
                 return usage(stderr, EXIT_FAILURE, 0);
             }
         case 'B': settings.remove_B = 1; break;
-        case 'x':
-            {
-                if (strlen(optarg) != 2) {
-                    print_error("main_samview", "Error parsing -x auxiliary tags should be exactly two characters long.");
-                    return usage(stderr, EXIT_FAILURE, 0);
-                }
-                settings.remove_aux = (char**)realloc(settings.remove_aux, sizeof(char*) * (++settings.remove_aux_len));
-                settings.remove_aux[settings.remove_aux_len-1] = optarg;
-            }
-            break;
+
         case 'M': settings.multi_region = 1; break;
-        case 1: no_pg = 1; break;
+        case LONGOPT('P'): no_pg = 1; break;
         case 'e':
             if (!(settings.filter = hts_filter_init(optarg))) {
                 print_error("main_samview", "Couldn't initialise filter");
                 return 1;
             }
             break;
+        case LONGOPT('r'): settings.remove_flag |= bam_str2flag(optarg); break;
+        case LONGOPT('a'): settings.add_flag |= bam_str2flag(optarg); break;
+
+        case 'x':
+            if (*optarg == '^') {
+                if (parse_aux_list(&settings.keep_tag, optarg+1))
+                    return usage(stderr, EXIT_FAILURE, 0);
+            } else {
+                if (parse_aux_list(&settings.remove_tag, optarg))
+                    return usage(stderr, EXIT_FAILURE, 0);
+            }
+            break;
+
+        case LONGOPT('x'):
+            if (parse_aux_list(&settings.keep_tag, optarg))
+                return usage(stderr, EXIT_FAILURE, 0);
+            break;
+
         default:
             if (parse_sam_global_opt(c, optarg, lopts, &ga) != 0)
                 return usage(stderr, EXIT_FAILURE, 0);
@@ -505,8 +702,7 @@ int main_samview(int argc, char *argv[])
     // Overridden by manual -b, -C
     if (*out_format)
         out_mode[1] = out_un_mode[1] = *out_format;
-    out_mode[2] = out_un_mode[2] = '\0';
-    // out_(un_)mode now 1 or 2 bytes long, followed by nul.
+    // out_(un_)mode now 1, 2 or 3 bytes long, followed by nul.
     if (compress_level >= 0) {
         char tmp[2];
         tmp[0] = compress_level + '0'; tmp[1] = '\0';
@@ -516,6 +712,12 @@ int main_samview(int argc, char *argv[])
     if (argc == optind && isatty(STDIN_FILENO)) {
         print_error("view", "No input provided or missing option argument.");
         return usage(stderr, EXIT_FAILURE, 0); // potential memory leak...
+    }
+    if (settings.subsam_seed != 0) {
+        // Convert likely user input 1,2,... to pseudo-random
+        // values with more entropy and more bits set
+        srand(settings.subsam_seed);
+        settings.subsam_seed = rand();
     }
 
     fn_in = (optind < argc)? argv[optind] : "-";
@@ -682,7 +884,10 @@ int main_samview(int argc, char *argv[])
                         // fetch alignments
                         while ((result = sam_itr_multi_next(in, iter, b)) >= 0) {
                             if (!process_aln(header, b, &settings)) {
-                                if (!is_count) { if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break; }
+                                if (!is_count) {
+                                    change_flag(b, &settings);
+                                    if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break;
+                                }
                                 count++;
                             } else {
                                 if (un_out) { if (check_sam_write1(un_out, header, b, fn_un_out, &ret) < 0) break; }
@@ -713,7 +918,10 @@ int main_samview(int argc, char *argv[])
             errno = 0;
             while ((r = sam_read1(in, header, b)) >= 0) { // read one alignment from `in'
                 if (!process_aln(header, b, &settings)) {
-                    if (!is_count) { if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break; }
+                    if (!is_count) {
+                        change_flag(b, &settings);
+                        if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break;
+                    }
                     count++;
                 } else {
                     if (un_out) { if (check_sam_write1(un_out, header, b, fn_un_out, &ret) < 0) break; }
@@ -751,7 +959,10 @@ int main_samview(int argc, char *argv[])
                 // fetch alignments
                 while ((result = sam_itr_next(in, iter, b)) >= 0) {
                     if (!process_aln(header, b, &settings)) {
-                        if (!is_count) { if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break; }
+                        if (!is_count) {
+                            change_flag(b, &settings);
+                            if (check_sam_write1(out, header, b, fn_out, &ret) < 0) break;
+                        }
                         count++;
                     } else {
                         if (un_out) { if (check_sam_write1(un_out, header, b, fn_un_out, &ret) < 0) break; }
@@ -817,6 +1028,7 @@ view_end:
             if (kh_exist(settings.tvhash, k)) free((char*)kh_key(settings.tvhash, k));
         kh_destroy(str, settings.tvhash);
     }
+
     if (settings.remove_aux_len) {
         free(settings.remove_aux);
     }
@@ -835,6 +1047,11 @@ view_end:
         free(fn_un_out_idx);
     free(arg_list);
 
+    if (settings.keep_tag)
+        kh_destroy(aux_exists, settings.keep_tag);
+    if (settings.remove_tag)
+        kh_destroy(aux_exists, settings.remove_tag);
+
     return ret;
 }
 
@@ -844,50 +1061,57 @@ static int usage(FILE *fp, int exit_status, int is_long_help)
 "\n"
 "Usage: samtools view [options] <in.bam>|<in.sam>|<in.cram> [region ...]\n"
 "\n"
-"Options:\n"
-// output options
-"  -b       output BAM\n"
-"  -C       output CRAM (requires -T)\n"
-"  -1       use fast BAM compression (implies -b)\n"
-"  -u       uncompressed BAM output (implies -b)\n"
-"  -h       include header in SAM output\n"
-"  -H       print SAM header only (no alignments)\n"
-"  -c       print only the count of matching records\n"
-"  -o FILE  output file name [stdout]\n"
-"  -U FILE  output reads not selected by filters to FILE [null]\n"
-// extra input
-"  -t FILE  FILE listing reference names and lengths (see long help) [null]\n"
-"  -X       include customized index file\n"
-// read filters
-"  -L FILE  only include reads overlapping this BED FILE [null]\n"
-"  -r STR   only include reads in read group STR [null]\n"
-"  -R FILE  only include reads with read group listed in FILE [null]\n"
-"  -N FILE  only include reads with read name listed in FILE [null]\n"
-"  -d STR1[:STR2]\n"
-"           only include reads with tag STR1 and associated value STR2 [null]\n"
-"           The value can be omitted, in which case only the tag is considered\n"
-"  -D STR:FILE\n"
-"           only include reads with tag STR and associated values listed in\n"
-"           FILE [null]\n"
-"  -q INT   only include reads with mapping quality >= INT [0]\n"
-"  -l STR   only include reads in library STR [null]\n"
-"  -m INT   only include reads with number of CIGAR operations consuming\n"
-"           query sequence >= INT [0]\n"
-"  -f INT   only include reads with all  of the FLAGs in INT present [0]\n"       //   F&x == x
-"  -F INT   only include reads with none of the FLAGS in INT present [0]\n"       //   F&x == 0
-"  -G INT   only EXCLUDE reads with all  of the FLAGs in INT present [0]\n"       // !(F&x == x)
-"  -e STR   only include reads matching the filter expression [null]\n"
-"  -s FLOAT subsample reads (given INT.FRAC option value, 0.FRAC is the\n"
-"           fraction of templates/read pairs to keep; INT part sets seed)\n"
-"  -M       use the multi-region iterator (increases the speed, removes\n"
-"           duplicates and outputs the reads as they are ordered in the file)\n"
-// read processing
-"  -x STR   read tag to strip (repeatable) [null]\n"
-"  -B       collapse the backward CIGAR operation\n"
-// general options
-"  -?       print long help, including note about region specification\n"
-"  -S       ignored (input format is auto-detected)\n"
-"  --no-PG  do not add a PG line\n");
+
+"Output options:\n"
+"  -b, --bam                  Output BAM\n"
+"  -C, --cram                 Output CRAM (requires -T)\n"
+"  -1, --fast                 Use fast BAM compression (implies --bam)\n"
+"  -u, --uncompressed         Uncompressed BAM output (implies --bam)\n"
+"  -h, --with-header          Include header in SAM output\n"
+"  -H, --header-only          Print SAM header only (no alignments)\n"
+"      --no-header            Print SAM alignment records only [default]\n"
+"  -c, --count                Print only the count of matching records\n"
+"  -o, --output FILE          Write output to FILE [standard output]\n"
+"  -U, --unoutput FILE, --output-unselected FILE\n"
+"                             Output reads not selected by filters to FILE\n"
+"Input options:\n"
+"  -t, --fai-reference FILE   FILE listing reference names and lengths\n"
+"  -M, --use-index            Use index and multi-region iterator for regions\n"
+"      --region[s]-file FILE  Use index to include only reads overlapping FILE\n"
+"  -X, --customized-index     Expect extra index file argument after <in.bam>\n"
+"\n"
+"Filtering options (Only include in output reads that...):\n"
+"  -L, --target[s]-file FILE  ...overlap (BED) regions in FILE\n"
+"  -r, --read-group STR       ...are in read group STR\n"
+"  -R, --read-group-file FILE ...are in a read group listed in FILE\n"
+"  -N, --qname-file FILE      ...whose read name is listed in FILE\n"
+"  -d, --tag STR1[:STR2]      ...have a tag STR1 (with associated value STR2)\n"
+"  -D, --tag-file STR:FILE    ...have a tag STR whose value is listed in FILE\n"
+"  -q, --min-MQ INT           ...have mapping quality >= INT\n"
+"  -l, --library STR          ...are in library STR\n"
+"  -m, --min-qlen INT         ...cover >= INT query bases (as measured via CIGAR)\n"
+"  -e, --expr STR             ...match the filter expression STR\n"
+"  -f, --require-flags FLAG   ...have all of the FLAGs present\n"             //   F&x == x
+"  -F, --excl[ude]-flags FLAG ...have none of the FLAGs present\n"            //   F&x == 0
+"  -G FLAG                    EXCLUDE reads with all of the FLAGs present\n"  // !(F&x == x)  TODO long option
+"      --subsample FLOAT      Keep only FLOAT fraction of templates/read pairs\n"
+"      --subsample-seed INT   Influence WHICH reads are kept in subsampling [0]\n"
+"  -s INT.FRAC                Same as --subsample 0.FRAC --subsample-seed INT\n"
+"\n"
+"Processing options:\n"
+"      --add-flags FLAG       Add FLAGs to reads\n"
+"      --remove-flags FLAG    Remove FLAGs from reads\n"
+"  -x, --remove-tag STR\n"
+"               Comma-separated read tags to strip (repeatable) [null]\n"
+"      --keep-tag STR\n"
+"               Comma-separated read tags to preserve (repeatable) [null].\n"
+"               Equivalent to \"-x ^STR\"\n"
+"  -B, --remove-B             Collapse the backward CIGAR operation\n"
+"\n"
+"General options:\n"
+"  -?, --help   Print long help, including note about region specification\n"
+"  -S           Ignored (input format is auto-detected)\n"
+"      --no-PG  Do not add a PG line\n");
 
     sam_global_opt_help(fp, "-.O.T@..");
     fprintf(fp, "\n");
@@ -927,6 +1151,15 @@ static int usage(FILE *fp, int exit_status, int is_long_help)
 "\n"
 "6. Option `-u' is preferred over `-b' when the output is piped to\n"
 "   another samtools command.\n"
+"\n"
+"7. Option `-M`/`--use-index` causes overlaps with `-L` BED file regions and\n"
+"   command-line region arguments to be computed using the multi-region iterator\n"
+"   and an index. This increases speed, omits duplicates, and outputs the reads\n"
+"   as they are ordered in the input SAM/BAM/CRAM file.\n"
+"\n"
+"8. Options `-L`/`--target[s]-file` and `--region[s]-file` may not be used\n"
+"   together. `--region[s]-file FILE` is simply equivalent to `-M -L FILE`,\n"
+"   so using both causes one of the specified BED files to be ignored.\n"
 "\n");
 
     return exit_status;

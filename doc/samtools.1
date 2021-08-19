@@ -1,5 +1,5 @@
 '\" t
-.TH samtools 1 "17 March 2021" "samtools-1.12" "Bioinformatics tools"
+.TH samtools 1 "7 July 2021" "samtools-1.13" "Bioinformatics tools"
 .SH NAME
 samtools \- Utilities for the Sequence Alignment/Map (SAM) format
 .\"
@@ -78,6 +78,8 @@ samtools merge out.bam in1.bam in2.bam in3.bam
 samtools split merged.bam
 .PP
 samtools cat out.bam in1.bam in2.bam in3.bam
+.PP
+samtools import input.fastq > output.bam
 .PP
 samtools fastq input.bam > output.fastq
 .PP
@@ -484,6 +486,18 @@ dictionary of each input file must be identical, although this command
 does not check this. This command uses a similar trick to
 .B reheader
 which enables fast BAM concatenation.
+
+.TP \"-------- import
+.B import
+samtools import
+.RI [ options ]
+.IR in.fastq " [ ... ]"
+
+Converts one or more FASTQ files to unaligned SAM, BAM or CRAM.  These
+formats offer a richer capability of tracking sample meta-data via the
+SAM header and per-read meta-data via the auxiliary tags.  The
+.B fastq
+command may be used to reverse this conversion.
 
 .TP \"-------- fastq fasta
 .B fastq/a
@@ -985,6 +999,7 @@ Valid variable names and their data types are:
 
 .TS
 lb l l .
+endpos	int	Alignment end position (1-based)
 flag	int	Combined FLAG field
 flag.paired	int	Single bit, 0 or 1
 flag.proper_pair	int	Single bit, 0 or 2
@@ -1026,6 +1041,11 @@ equivalent to \fBflag & 1024\fR.
 number of query (sequence) and reference bases consumed.  Note "qlen"
 may not exactly match the length of the "seq" field if the sequence is
 "*".
+
+"endpos" is the (1-based inclusive) position of the rightmost mapped base
+of the read, as measured using the CIGAR string, and for mapped reads
+is equivalent to "pos+rlen-1". For unmapped reads, it is the same as
+"pos".
 
 Reference names may be matched either by their string forms ("rname"
 and "mrname") or as the Nth \fB@SQ\fR line (counting from zero) as
@@ -1180,6 +1200,7 @@ for further authorship.
 .IR samtools-flagstat (1),
 .IR samtools-fqidx (1),
 .IR samtools-idxstats (1),
+.IR samtools-import (1),
 .IR samtools-index (1),
 .IR samtools-markdup (1),
 .IR samtools-merge (1),
